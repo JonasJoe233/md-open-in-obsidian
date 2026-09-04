@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""
+md-open-in-obsidian — open a Markdown file in Obsidian *at that note*.
+
+Why this exists
+---------------
+Obsidian's macOS `open-file` handler (the Apple Event Finder sends on
+double-click) uses the incoming path only to reverse-look-up which vault
+contains it, then opens that vault and discards the path:
+
+    app.on("open-file", function(event, filePath){
+      event.preventDefault();
+      let resolved = path.resolve(filePath), matched = "";
+      for (let id in vaults) {
+        let vaultPath = vaults[id].path;
+        if (resolved.startsWith(vaultPath) && matched.length < vaultPath.length)
+          matched = vaultPath;
+      }
+      matched && openVault(matched);   // <- file path never used again
+    })
+
+So double-clicking a note lands you on whatever tab was last open. The
+`obsidian://` URI handler is a separate code path that *does* navigate to a
+file. This script translates the former into the latter.
+
+It does not guess when Obsidian is "ready" — it fires the URI, then reads the
+vault's own `.obsidian/workspace.json` to confirm the target actually became
+the active tab, and re-fires until it did. Re-firing is idempotent.
+
+No third-party dependencies; stdlib only.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+
+# --- configuration ----------------------------------------------------------
+# Overridable via environment, or ~/.config/md-open-in-obsidian/config.json.
+
+DEFAULTS = {
+    # App to hand the file to when Obsidian cannot open it (not in any vault,
+    # or an unaddressable filename). Empty string disables the fallback.
+    "fallback_app": "TextEdit",
+    # How many times to re-fire the URI before giving up.
+    "max_attempts": 6,
+    # Seconds to watch for the file to become the active tab, per attempt.
+    "attempt_timeout": 3.0,
+    # How often to re-read workspace.json while watching.
+    "poll_interval": 0.25,
+    # Trim the log once it exceeds this many bytes.
+    "max_log_bytes": 256 * 1024,
+}
+
+CONFIG_PATH = Path.home() / ".config" / "md-open-in-obsidian" / "config.json"
+VAULT_REGISTRY = (
+    Path.home() / "Library" / "Application Support" / "obsidian" / "obsidian.json"
+)
+LOG_PATH = Path.home() / "Library" / "Logs" / "md-open-in-obsidian.log"
+
+# Characters that survive as percent-escapes all the way into Obsidian's URI
+# parser and therefore make a file unaddressable. `#` is the only one observed
+# to break in practice: it re-emerges as a fragment delimiter and truncates the
+# path. Double-encoding, ?vault=&file=, and obsidian://vault/<name>/<path> were
+# all tested and fail the same way.
+UNADDRESSABLE_CHARS = "#"
+
+
+def load_config() -> dict:
+    """DEFAULTS < config.json < MD_OPEN_* environment variables."""
+    global _log_cap
+    cfg = dict(DEFAULTS)
+    try:
+        cfg.update(json.loads(CONFIG_PATH.read_text()))
+    except FileNotFoundError:
+        pass
+    except (json.JSONDecodeError, OSError) as exc:
+        log(f"WARN unreadable config {CONFIG_PATH}: {exc}")
+
+    for key, default in DEFAULTS.items():
+        raw = os.environ.get("MD_OPEN_" + key.upper())
+        if raw is None:
+            continue
+        try:
+            cfg[key] = type(default)(raw)
+        except (TypeError, ValueError):
+            log(f"WARN bad env value for {key}: {raw!r}")
+
+    # Clamp the loop parameters so a typo in config.json cannot leave a process
+    # spinning for hours behind a double-click.
+    cfg["max_attempts"] = max(1, min(int(cfg["max_attempts"]), 30))
+    cfg["attempt_timeout"] = max(0.1, min(float(cfg["attempt_timeout"]), 30.0))
+    cfg["poll_interval"] = max(0.05, min(float(cfg["poll_interval"]), 5.0))
+    _log_cap = max(4096, int(cfg["max_log_bytes"]))
+    return cfg
+
+
+# Log cap lives at module scope because log() runs before the config is parsed.
+_log_cap = DEFAULTS["max_log_bytes"]
+
+
+def log(message: str) -> None:
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # Trim from the front once the log passes the cap, so a runaway loop
+        # cannot fill the disk.
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > _log_cap:
+            tail = LOG_PATH.read_bytes()[-_log_cap // 2 :]
+            LOG_PATH.write_bytes(tail[tail.find(b"\n") + 1 :])
+        with LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(f"{stamp} {message}\n")
+    except OSError:
+        pass  # never let logging break the open
+    if sys.stdout.isatty():
+        print(message)
+
+
+def read_vaults() -> list[Path]:
+    """Vault roots from Obsidian's own registry, longest path first."""
+    try:
+        registry = json.loads(VAULT_REGISTRY.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        log(f"WARN cannot read vault registry {VAULT_REGISTRY}: {exc}")
+        return []
+    paths = []
+    for vault in (registry.get("vaults") or {}).values():
+        raw = vault.get("path")
+        if raw:
+            paths.append(Path(os.path.realpath(raw)))
+    # Longest first so nested vaults resolve to the innermost one, matching
+    # Obsidian's own longest-prefix logic.
+    return sorted(paths, key=lambda p: len(str(p)), reverse=True)
+
+
+def resolve_vault(target: Path) -> tuple[Path, str] | None:
+    """Return (vault_root, path_relative_to_vault) or None if outside all vaults."""
+    for root in read_vaults():
+        try:
+            rel = target.relative_to(root)
+        except ValueError:
+            continue  # relative_to enforces the directory boundary for us
+        if rel.parts:  # the vault root itself is not a note
+            return root, rel.as_posix()
+    return None
+
+
+def workspace_readable(vault: Path) -> bool:
+    """Whether we can observe this vault's state well enough to verify a jump."""
+    try:
+        (vault / ".obsidian" / "workspace.json").read_bytes()
+        return True
+    except OSError:
+        return False
+
+
+def active_file(vault: Path) -> str | None:
+    """The vault's currently focused note, per its persisted workspace.
+
+    Returns None when the workspace cannot be read at all — notably when the
+    vault lives under a TCC-protected directory (Downloads, Documents,
+    Desktop), where a non-consented caller gets EPERM on the dotfile even
+    though the note itself opens fine.
+    """
+    try:
+        workspace = json.loads((vault / ".obsidian" / "workspace.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    active_id = workspace.get("active")
+
+    def walk(node: dict) -> str | None:
+        if node.get("type") == "leaf" and node.get("id") == active_id:
+            return (node.get("state", {}).get("state") or {}).get("file")
+        for child in node.get("children", []):
+            hit = walk(child)
+            if hit:
+                return hit
+        return None
+
+    return walk(workspace.get("main") or {})
+
+
+def fire_uri(target: Path) -> None:
+    uri = "obsidian://open?path=" + urllib.parse.quote(str(target))
+    subprocess.run(["/usr/bin/open", uri], check=False)
+
+
+def fallback(target: Path, app: str, reason: str) -> None:
+    if not app:
+        log(f"GIVE UP {reason}: {target}")
+        return
+    log(f"FALLBACK {reason} -> {app}: {target}")
+    subprocess.run(["/usr/bin/open", "-a", app, str(target)], check=False)
+
+
+def open_in_obsidian(raw: str, cfg: dict) -> None:
+    target = Path(os.path.realpath(os.path.expanduser(raw)))
+    if not target.is_file():
+        log(f"SKIP not a file: {target}")
+        return
+
+    bad = [c for c in UNADDRESSABLE_CHARS if c in target.name]
+    if bad:
+        # Obsidian's URI parser cannot round-trip these, so no number of
+        # retries would help. Hand off immediately instead of spinning.
+        fallback(target, cfg["fallback_app"], f"filename contains {bad!r}")
+        return
+
+    resolved = resolve_vault(target)
+    if resolved is None:
+        fallback(target, cfg["fallback_app"], "not inside any vault")
+        return
+    vault, rel = resolved
+
+    # If the workspace is unreadable we cannot verify the jump. Fire once and
+    # trust it rather than retrying blind — repeated URIs would still work, but
+    # there would be no stopping condition and we would log a false failure.
+    # This is the normal case for vaults under TCC-protected directories when
+    # the caller has not been granted Full Disk Access.
+    if not workspace_readable(vault):
+        fire_uri(target)
+        log(f"OK unverified (workspace unreadable) vault={vault} file={rel}")
+        return
+
+    for attempt in range(1, cfg["max_attempts"] + 1):
+        fire_uri(target)
+        deadline = time.monotonic() + cfg["attempt_timeout"]
+        while time.monotonic() < deadline:
+            time.sleep(cfg["poll_interval"])
+            if active_file(vault) == rel:
+                log(f"OK attempt={attempt} vault={vault} file={rel}")
+                return
+    log(f"FAIL after {cfg['max_attempts']} attempts vault={vault} file={rel}")
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2 or argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        print("\nusage: md-open-in-obsidian FILE [FILE ...]")
+        return 0 if len(argv) >= 2 else 2
+
+    cfg = load_config()
+    for raw in argv[1:]:
+        open_in_obsidian(raw, cfg)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

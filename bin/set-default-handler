@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""
+set-default-handler — point a UTI's default app at a bundle identifier.
+
+`LSSetDefaultRoleHandlerForContentType` returns noErr on recent macOS while
+silently declining to change anything for some UTIs. When that happens this
+script falls back to editing the LaunchServices preference file directly and
+restarting the per-user `lsd`, which is what actually makes the change stick.
+
+The plist is backed up before it is touched.
+
+usage:
+    set-default-handler <uti> <bundle-id>
+    set-default-handler --show <uti>
+"""
+
+from __future__ import annotations
+
+import ctypes
+import getpass
+import plistlib
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CF = ctypes.cdll.LoadLibrary(
+    "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+)
+LS = ctypes.cdll.LoadLibrary(
+    "/System/Library/Frameworks/CoreServices.framework/CoreServices"
+)
+
+UTF8 = 0x08000100
+ROLE_ALL = 0xFFFFFFFF
+SECURE_PLIST = (
+    Path.home()
+    / "Library"
+    / "Preferences"
+    / "com.apple.LaunchServices"
+    / "com.apple.launchservices.secure.plist"
+)
+
+CF.CFStringCreateWithCString.restype = ctypes.c_void_p
+CF.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+CF.CFStringGetCString.restype = ctypes.c_bool
+CF.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+LS.LSSetDefaultRoleHandlerForContentType.restype = ctypes.c_int32
+LS.LSSetDefaultRoleHandlerForContentType.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+LS.LSCopyDefaultRoleHandlerForContentType.restype = ctypes.c_void_p
+LS.LSCopyDefaultRoleHandlerForContentType.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+
+
+def cfstr(text: str) -> ctypes.c_void_p:
+    return CF.CFStringCreateWithCString(None, text.encode(), UTF8)
+
+
+def pystr(ref) -> str | None:
+    if not ref:
+        return None
+    buf = ctypes.create_string_buffer(1024)
+    if CF.CFStringGetCString(ref, buf, 1024, UTF8):
+        return buf.value.decode()
+    return None
+
+
+def current_handler(uti: str) -> str | None:
+    return pystr(LS.LSCopyDefaultRoleHandlerForContentType(cfstr(uti), ROLE_ALL))
+
+
+def patch_plist(uti: str, bundle_id: str) -> None:
+    """Rewrite the LSHandlers entry for `uti`, backing the plist up first."""
+    if not SECURE_PLIST.exists():
+        raise SystemExit(f"missing {SECURE_PLIST}")
+
+    backup = SECURE_PLIST.with_suffix(
+        SECURE_PLIST.suffix + f".bak.{time.strftime('%Y%m%d-%H%M%S')}"
+    )
+    shutil.copy2(SECURE_PLIST, backup)
+    print(f"backed up -> {backup}")
+
+    data = plistlib.loads(SECURE_PLIST.read_bytes())
+    handlers = data.setdefault("LSHandlers", [])
+    for entry in handlers:
+        if entry.get("LSHandlerContentType") == uti:
+            entry["LSHandlerRoleAll"] = bundle_id
+            break
+    else:
+        handlers.append({"LSHandlerContentType": uti, "LSHandlerRoleAll": bundle_id})
+    SECURE_PLIST.write_bytes(plistlib.dumps(data))
+
+    # lsd caches the file; it must be restarted to pick the change up.
+    # Scope the kill to this user so a root-owned lsd is left alone.
+    subprocess.run(["killall", "-u", getpass.getuser(), "lsd"], check=False,
+                   stderr=subprocess.DEVNULL)
+    time.sleep(4)
+
+
+def set_handler(uti: str, bundle_id: str) -> int:
+    before = current_handler(uti)
+    print(f"{uti}: {before or '(none)'}")
+    if before == bundle_id:
+        print("already set, nothing to do")
+        return 0
+
+    LS.LSSetDefaultRoleHandlerForContentType(cfstr(uti), ROLE_ALL, cfstr(bundle_id))
+    time.sleep(1)
+    if current_handler(uti) == bundle_id:
+        print(f"-> {bundle_id} (via LaunchServices API)")
+        return 0
+
+    print("LaunchServices API declined; patching the preference file")
+    patch_plist(uti, bundle_id)
+
+    # Re-read from a fresh process; the in-process LS cache is stale by now.
+    result = subprocess.run(
+        [sys.executable, __file__, "--show", uti], capture_output=True, text=True
+    )
+    final = result.stdout.strip()
+    print(f"-> {final} (via preference file)")
+    return 0 if final == bundle_id else 1
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) == 3 and argv[1] == "--show":
+        print(current_handler(argv[2]) or "(none)")
+        return 0
+    if len(argv) != 3:
+        print(__doc__.strip())
+        return 2
+    return set_handler(argv[1], argv[2])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
