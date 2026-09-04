@@ -20,7 +20,9 @@ fi
 
 info "removing files"
 rm -rf "$APP"
-rm -f "$PREFIX/bin/md-open-in-obsidian" "$PREFIX/bin/set-default-handler"
+rm -f "$PREFIX/bin/md-open-in-obsidian" \
+      "$PREFIX/bin/set-default-handler" \
+      "$PREFIX/bin/grant-full-disk-access"
 
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 "$LSREGISTER" -kill -r -domain local -domain system -domain user >/dev/null 2>&1 || true
@@ -28,5 +30,9 @@ LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchSe
 print -P "%F{green}done%f — log and config left in place:"
 print "  ~/Library/Logs/md-open-in-obsidian.log"
 print "  ~/.config/md-open-in-obsidian/"
+print ""
+print "If you granted MDOpener Full Disk Access, remove it by hand:"
+print "  System Settings -> Privacy & Security -> Full Disk Access"
+print ""
 print "LaunchServices plist backups (if any) are next to:"
 print "  ~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist"

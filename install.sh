@@ -25,6 +25,7 @@ info "installing scripts to $PREFIX/bin"
 mkdir -p "$PREFIX/bin"
 install -m 755 "$REPO_DIR/bin/md-open-in-obsidian" "$LAUNCHER"
 install -m 755 "$REPO_DIR/bin/set-default-handler" "$PREFIX/bin/set-default-handler"
+install -m 755 "$REPO_DIR/bin/grant-full-disk-access" "$PREFIX/bin/grant-full-disk-access"
 
 # 2. the .app that receives Finder's Apple Event
 info "building $APP"
@@ -79,6 +80,10 @@ if [[ "$RESOLVED" == "$BUNDLE_ID" ]]; then
   print "  launcher: $LAUNCHER"
   print "  app:      $APP"
   print "  log:      ~/Library/Logs/md-open-in-obsidian.log"
+  print ""
+  print "macOS will ask once per protected folder (Desktop/Documents/Downloads)"
+  print "the first time you open a note there. To skip those prompts entirely:"
+  print "  $PREFIX/bin/grant-full-disk-access"
 else
   die "handler is '$RESOLVED', expected '$BUNDLE_ID' — see README troubleshooting"
 fi

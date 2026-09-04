@@ -1,5 +1,7 @@
 # md-open-in-obsidian
 
+[中文](README.zh-CN.md)
+
 Double-clicking a Markdown file on macOS with Obsidian set as the default app
 opens Obsidian — but not the file you clicked. You land on whatever tab was
 open last. This makes it open the actual note.
@@ -93,6 +95,38 @@ plus the filename edge case below. Set it to `""` to do nothing instead.
 
 Activity is logged to `~/Library/Logs/md-open-in-obsidian.log` (self-trimming).
 
+## Permission prompts
+
+macOS gates `~/Desktop`, `~/Documents`, and `~/Downloads` behind TCC. MDOpener
+never reads your notes — Obsidian does that — but it does read
+`<vault>/.obsidian/workspace.json` to confirm a jump landed, and that read is
+what triggers *"MDOpener would like to access files in your Downloads folder"*.
+
+The prompt appears **once per folder** and macOS remembers the answer, so for a
+typical setup this is two or three clicks, ever. Allowing them is the smaller
+grant and the recommended choice.
+
+If you would rather see no prompt at all, Full Disk Access covers every folder
+at once:
+
+```sh
+~/.local/bin/grant-full-disk-access          # opens the right pane, reveals the app
+~/.local/bin/grant-full-disk-access --check  # report status and exit
+```
+
+The grant cannot be scripted — `/Library/Application Support/com.apple.TCC/TCC.db`
+is root-owned and `tccd` rejects third-party writes even as root while SIP is
+enabled. The helper does the automatable parts: it reports which vaults are
+currently readable, opens System Settings on the exact pane, and reveals
+`MDOpener.app` in the Finder so it can be dragged in.
+
+Status is read from the launcher's own log rather than probed directly, because
+TCC is per process — a terminal that happens to hold Full Disk Access would
+report success while MDOpener still fails.
+
+Declining costs you only the verification step: notes still open correctly,
+they are just recorded as `OK unverified` rather than confirmed.
+
 ## Known limitations
 
 **Filenames containing `#` fall back to the other app.** Obsidian's URI parser
@@ -104,13 +138,11 @@ fails the same way. Since no amount of retrying can fix it, such files are
 handed to `fallback_app` immediately rather than spinning. Spaces, `&`, `+`,
 `%`, and non-ASCII names all work.
 
-**Vaults under TCC-protected directories cannot be verified.** If a vault lives
-in `~/Downloads`, `~/Documents`, or `~/Desktop`, reading its
-`.obsidian/workspace.json` may return `EPERM` unless the calling process has
-been granted Full Disk Access — even though the note itself opens fine. In that
-case the URI is fired once and logged as `OK unverified` rather than retried
-blind. Grant Full Disk Access to your terminal (or to `MDOpener.app`) if you
-want verification there.
+**Vaults under TCC-protected directories cannot be verified without a grant.**
+If a vault lives in `~/Downloads`, `~/Documents`, or `~/Desktop`, reading its
+`.obsidian/workspace.json` returns `EPERM` until access is allowed — even though
+the note itself opens fine. In that case the URI is fired once and logged as
+`OK unverified` rather than retried blind. See [Permission prompts](#permission-prompts).
 
 **`.mdown` / `.mkd` / `.mdtext` are not claimed.** Those extensions have no
 registered UTI on macOS, only a per-machine dynamic one, and LaunchServices
@@ -150,6 +182,7 @@ delivered but the note never became active — worth an issue.
 |---|---|
 | `bin/md-open-in-obsidian` | The logic: vault resolution, URI dispatch, landing verification |
 | `bin/set-default-handler` | Sets a UTI's default app, with the plist fallback for when the API lies |
+| `bin/grant-full-disk-access` | Reports TCC status per vault and walks you through the grant |
 | `src/MDOpener.applescript` | Source for the `.app` that receives the Finder event |
 | `install.sh` / `uninstall.sh` | Idempotent setup and teardown |
 

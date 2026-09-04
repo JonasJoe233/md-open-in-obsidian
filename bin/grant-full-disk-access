@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""
+grant-full-disk-access — help MDOpener read vaults in protected folders.
+
+What the prompts are
+--------------------
+macOS gates ~/Desktop, ~/Documents, and ~/Downloads behind TCC. MDOpener never
+needs to read your notes — Obsidian opens those — but it does read
+`<vault>/.obsidian/workspace.json` to confirm a jump landed. That read is what
+triggers "MDOpener would like to access files in your Downloads folder".
+
+The prompt appears once per folder and the answer is remembered, so for most
+setups this is two or three clicks, ever. Full Disk Access pre-empts them all,
+at the cost of a much broader grant. Decide accordingly — declining costs you
+only the verification step: notes still open, they are just logged as
+`OK unverified` instead of confirmed.
+
+Why this is interactive
+-----------------------
+Full Disk Access cannot be granted from a script. The authoritative store is
+`/Library/Application Support/com.apple.TCC/TCC.db`, owned by root:wheel, and
+tccd rejects third-party writes even as root while SIP is on — verified, not
+assumed. No public API can request `kTCCServiceSystemPolicyAllFiles`; only the
+user, in System Settings, can turn it on. So this script does the automatable
+parts: report status, open the exact pane, reveal the app to drag in.
+
+Status comes from the launcher's own log rather than from a probe run here.
+TCC is per process: a terminal that happens to hold Full Disk Access would
+report success while MDOpener still fails. The log is written by MDOpener with
+MDOpener's permissions, so it is the only honest source.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+APP_PATH = Path(os.environ.get("APP_DIR", Path.home() / "Applications")) / "MDOpener.app"
+LOG_PATH = Path.home() / "Library" / "Logs" / "md-open-in-obsidian.log"
+VAULT_REGISTRY = (
+    Path.home() / "Library" / "Application Support" / "obsidian" / "obsidian.json"
+)
+FDA_PANE = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+
+# Folders macOS gates behind TCC.
+PROTECTED = ("Desktop", "Documents", "Downloads")
+
+LOG_LINE = re.compile(
+    r"^(?P<time>[\d-]+ [\d:]+) OK (?P<verdict>attempt|unverified).*? vault=(?P<vault>.+?) file="
+)
+
+
+def protected_vaults() -> list[Path]:
+    """Registered vaults that live inside a TCC-gated folder."""
+    try:
+        registry = json.loads(VAULT_REGISTRY.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"cannot read the Obsidian vault registry: {exc}")
+        return []
+    roots = [Path.home() / name for name in PROTECTED]
+    found = []
+    for vault in (registry.get("vaults") or {}).values():
+        raw = vault.get("path")
+        if not raw:
+            continue
+        path = Path(os.path.realpath(raw))
+        if any(path == r or r in path.parents for r in roots):
+            found.append(path)
+    return sorted(set(found))
+
+
+def last_verdicts() -> dict[str, tuple[str, str]]:
+    """Most recent {vault: (verdict, timestamp)} from the launcher's log.
+
+    'OK attempt=N' means the jump was verified, so the folder is readable.
+    'OK unverified' means workspace.json could not be read.
+    """
+    try:
+        lines = LOG_PATH.read_text(errors="replace").splitlines()
+    except OSError:
+        return {}
+    seen: dict[str, tuple[str, str]] = {}
+    for line in lines:
+        match = LOG_LINE.match(line)
+        if match:
+            verdict = "verified" if match["verdict"] == "attempt" else "unverified"
+            seen[match["vault"]] = (verdict, match["time"])
+    return seen
+
+
+def report(vaults: list[Path]) -> list[Path]:
+    """Print per-vault status; return the vaults with no evidence of access."""
+    verdicts = last_verdicts()
+    needs_grant = []
+    for vault in vaults:
+        entry = verdicts.get(str(vault))
+        if entry is None:
+            print(f"  {vault}: not opened yet — status unknown")
+            needs_grant.append(vault)
+        elif entry[0] == "verified":
+            print(f"  {vault}: readable (last confirmed {entry[1]})")
+        else:
+            print(f"  {vault}: NOT readable (last seen {entry[1]})")
+            needs_grant.append(vault)
+    return needs_grant
+
+
+def main(argv: list[str]) -> int:
+    check_only = "--check" in argv[1:]
+
+    if not APP_PATH.exists():
+        print(f"MDOpener.app not found at {APP_PATH}. Run ./install.sh first.")
+        return 1
+
+    vaults = protected_vaults()
+    if not vaults:
+        print(
+            "No vaults live under Desktop, Documents, or Downloads, so macOS will\n"
+            "not prompt for access and no grant is needed."
+        )
+        return 0
+
+    print("Vaults inside TCC-protected folders:")
+    pending = report(vaults)
+
+    if not pending:
+        print("\nAll readable — Full Disk Access is not needed.")
+        return 0
+    if check_only:
+        return 1
+
+    print(
+        "\nThe folders above will prompt once each the next time you open a note\n"
+        "there, and macOS remembers the answer. If you would rather not see any\n"
+        "prompt, grant Full Disk Access instead — a broader permission that\n"
+        "covers all of them at once.\n"
+        "\n"
+        "It cannot be granted from a script: the TCC database is root-owned and\n"
+        "tccd rejects third-party writes while SIP is enabled. Two windows are\n"
+        "about to open.\n"
+        "\n"
+        "  1. System Settings -> Privacy & Security -> Full Disk Access\n"
+        "  2. Finder, with MDOpener.app selected\n"
+        "\n"
+        "Drag MDOpener.app into the list (or press + and pick it), switch it on,\n"
+        "then reopen a note in one of the folders above and re-run with --check."
+    )
+    try:
+        input("\nPress Return to open them, or Ctrl-C to skip... ")
+    except (EOFError, KeyboardInterrupt):
+        print("\nskipped")
+        return 1
+
+    subprocess.run(["/usr/bin/open", FDA_PANE], check=False)
+    time.sleep(1)
+    subprocess.run(["/usr/bin/open", "-R", str(APP_PATH)], check=False)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
