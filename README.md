@@ -59,7 +59,7 @@ first attempt (~1 s warm, ~3 s cold).
 ## Install
 
 ```sh
-git clone https://github.com/<you>/md-open-in-obsidian.git
+git clone https://github.com/JonasJoe233/md-open-in-obsidian.git
 cd md-open-in-obsidian
 ./install.sh
 ```
