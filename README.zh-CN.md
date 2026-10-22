@@ -115,6 +115,20 @@ macOS 用 TCC 管着 `~/Desktop`、`~/Documents`、`~/Downloads` 三个目录。
 不授权只损失验证这一步：笔记照样正常打开，只是日志记成 `OK unverified` 而不是已
 确认。
 
+## 让文件列表跟着定位
+
+本工具只负责跳到笔记，不碰 Obsidian 的文件列表。所以侧边栏停在原处，笔记所在目录
+可能还是折叠的。这一步发生在 Obsidian 内部，要靠插件，而且要逐个 vault 安装：
+Obsidian 没有全局插件。
+
+推荐 [Auto Reveal in Explorer](https://github.com/martinopolo/obsidian-auto-reveal-in-explorer)
+（社区插件 id `auto-reveal-in-explorer`）。每次打开文件，它会展开父目录、选中笔记、
+滚动到可见位置，键盘焦点留在编辑器里。
+
+不要用每次打开都调文件列表自带 `revealInFolder` 或
+`file-explorer:reveal-active-file` 命令的插件。两者都会把焦点移到侧边栏，你没法
+马上打字；本工具的验证循环也会把文件列表看成当前标签，一直重发 URI 直到放弃。
+
 ## 已知限制
 
 **文件名含 `#` 的会回落到备选程序。** Obsidian 的 URI 解析器用 `decodeURI` 解码，

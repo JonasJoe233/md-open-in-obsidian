@@ -127,6 +127,24 @@ report success while MDOpener still fails.
 Declining costs you only the verification step: notes still open correctly,
 they are just recorded as `OK unverified` rather than confirmed.
 
+## Make the file explorer follow
+
+This tool gets you to the note. It does not touch Obsidian's file explorer, so
+the sidebar stays wherever it was and the note's folder may still be collapsed.
+That part lives inside Obsidian and needs a plugin, installed per vault:
+Obsidian has no global plugins.
+
+[Auto Reveal in Explorer](https://github.com/martinopolo/obsidian-auto-reveal-in-explorer)
+(community plugin id `auto-reveal-in-explorer`) does it well: on every file
+open it expands the parent folders, selects the note, and scrolls it into view,
+while keyboard focus stays in the editor.
+
+Avoid plugins that call the explorer's built-in `revealInFolder` or the
+`file-explorer:reveal-active-file` command on every open. Both move focus to
+the sidebar, so you cannot type right away, and this tool's verification loop
+sees the explorer as the active tab and keeps re-firing the URI until it gives
+up.
+
 ## Known limitations
 
 **Filenames containing `#` fall back to the other app.** Obsidian's URI parser
